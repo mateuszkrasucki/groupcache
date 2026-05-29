@@ -35,14 +35,22 @@ import (
 	pb "github.com/ccpgames/groupcache/v2/groupcachepb"
 	"github.com/ccpgames/groupcache/v2/lru"
 	"github.com/ccpgames/groupcache/v2/singleflight"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	remoteOperationTimeout = 30 * time.Second
+	remoteOperationTimeout            = 30 * time.Second
+	maxRemoteCallErrorRetryTime       = 250 * time.Millisecond
+	remoteCallErrorBackoffInitial     = time.Millisecond
+	remoteCallErrorBackoffMaxInterval = 20 * time.Millisecond
+
+	otelAttributePeerURL = attribute.Key("app.groupcache.peer_url")
 )
 
-var logger Logger
+var logger Logger = NoopLogger{}
 
 // SetLogger - this is legacy to provide backwards compatibility with logrus.
 func SetLogger(log *logrus.Entry) {
@@ -319,25 +327,11 @@ func (g *Group) Set(ctx context.Context, key string, value []byte, expire time.T
 	}
 
 	_, err := g.setGroup.Do(ctx, key, func() (interface{}, error) {
-		// If remote peer owns this key
-		owner, ok := g.peers.PickPeer(key)
-		if ok {
-			// we don't own the key
-			// first, let's set the value remotely to the owner peer
-			if err := g.setFromPeer(ctx, owner, key, value, expire); err != nil {
-				return nil, err
-			}
-			// If hotCache is true, we set local hot cache.
-			// TODO(thrawn01): Not sure if this is useful outside of tests...
-			//  maybe we should ALWAYS update the local cache?
-			if hotCache {
-				g.localHotCacheSet(key, value, expire)
-			}
-			// and then we clear the key from all the peers that are not key owner to prevent stale values from being served from those peers.
-			err := g.removeFromPeers(ctx, key, owner)
-			if err != nil {
-				return nil, err
-			}
+		executed, err := g.setIfRemoteOwner(ctx, key, value, expire, hotCache)
+		if err != nil {
+			return nil, err
+		}
+		if executed {
 			return nil, nil
 		}
 		// we own this key so we populate the main cache
@@ -345,7 +339,7 @@ func (g *Group) Set(ctx context.Context, key string, value []byte, expire time.T
 		// and we always populate the hot cache to maximize chances of early cache hits
 		g.localHotCacheSet(key, value, expire)
 		// and then let's call all other peers to clear the key from their caches
-		err := g.removeFromPeers(ctx, key, nil)
+		err = g.removeFromPeers(ctx, key, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -360,21 +354,15 @@ func (g *Group) Remove(ctx context.Context, key string) error {
 	g.peersOnce.Do(g.initPeers)
 
 	_, err := g.removeGroup.Do(ctx, key, func() (interface{}, error) {
-		var ownerRemoveErr error
+		remoteOwner, remoteOwnerRemoveErr := g.removeFromRemoteOwner(ctx, key)
 
-		// let's check who own the key
-		owner, ok := g.peers.PickPeer(key)
-		if ok {
-			// if we don't own the key let's attempt first to remotely remove it from the owner peer
-			ownerRemoveErr = g.removeFromPeer(ctx, owner, key)
-		}
 		// remove from our cache next
 		g.localRemove(key)
 
 		// then clear the key from all hot and main caches of peers
-		peersRemoveErr := g.removeFromPeers(ctx, key, owner)
+		peersRemoveErr := g.removeFromPeers(ctx, key, remoteOwner)
 
-		return nil, errors.Join(ownerRemoveErr, peersRemoveErr)
+		return nil, errors.Join(remoteOwnerRemoveErr, peersRemoveErr)
 	})
 	return err
 }
@@ -452,62 +440,14 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		g.Stats.LoadsDeduped.Add(1)
 		var value ByteView
 		var err error
-		if peer, ok := g.peers.PickPeer(key); ok {
-			// we do not own the key
-			// let's check the hot cache again because it might got populated before we entered
-			// singleflight
-			if value, cacheHit := g.lookupHotCache(key); cacheHit {
-				g.Stats.CacheHits.Add(1)
-				return value, nil
-			}
-			// metrics duration start
-			start := time.Now()
-
-			// get value from peers
-			value, err = g.getFromPeer(ctx, peer, key)
-
-			// metrics duration compute
-			duration := int64(time.Since(start)) / int64(time.Millisecond)
-
-			// metrics only store the slowest duration
-			if g.Stats.GetFromPeersLatencyLower.Get() < duration {
-				g.Stats.GetFromPeersLatencyLower.Store(duration)
-			}
-
-			if err == nil {
-				// populate hot cache with the value retrieved from peer
-				g.populateHotCache(key, value)
-				g.Stats.PeerLoads.Add(1)
-				return value, nil
-			}
-
-			if errors.Is(err, context.Canceled) {
-				return nil, err
-			}
-
-			if errors.Is(err, &ErrNotFound{}) {
-				return nil, err
-			}
-
-			if errors.Is(err, &ErrRemoteCall{}) {
-				return nil, err
-			}
-
-			if logger != nil {
-				logger.Error().
-					WithFields(map[string]interface{}{
-						"err":      err,
-						"key":      key,
-						"category": "groupcache",
-					}).Printf("error retrieving key from peer '%s'", peer.GetURL())
-			}
-
-			g.Stats.PeerErrors.Add(1)
-			if ctx != nil && ctx.Err() != nil {
-				// if the context has expired, we return the context error instead of the peer error to avoid retrying on peer errors
-				// when the context has already expired
-				return nil, ctx.Err()
-			}
+		var loadedFromRemote bool
+		loadedFromRemote, value, err = g.loadFromRemoteIfRemoteOwner(ctx, key)
+		if loadedFromRemote && err == nil {
+			return value, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, &ErrNotFound{}) {
+			return nil, err
+			// otherwise we want to attempt to load locally
 		}
 
 		value, destPopulated, err = g.loadLocally(ctx, key, dest)
@@ -522,7 +462,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 	return
 }
 
-// load loads key either by invoking the getter locally or by sending it to another machine.
+// loadLocally loads key either by invoking the getter locally or by sending it to another machine.
 func (g *Group) loadLocally(ctx context.Context, key string, dest Sink) (value ByteView, destPopulated bool, err error) {
 	g.Stats.LocalLoads.Add(1)
 	// Load locally:
@@ -586,6 +526,131 @@ func (g *Group) getLocally(ctx context.Context, key string, dest Sink) (ByteView
 		return ByteView{}, err
 	}
 	return dest.view()
+}
+
+func (g *Group) loadFromRemoteIfRemoteOwner(ctx context.Context, key string) (loaded bool, value ByteView, err error) {
+	loaded, _, err = g.callRemoteIfRemoteOwner(ctx, key, func(ctx context.Context, peer ProtoGetter) error {
+		// we do not own the key
+		// let's check the hot cache again because it might got populated before we entered
+		// singleflight
+		var cacheHit bool
+		if value, cacheHit = g.lookupHotCache(key); cacheHit {
+			g.Stats.CacheHits.Add(1)
+			return nil
+		}
+
+		// metrics duration start
+		start := time.Now()
+
+		// get value from peers
+		value, err = g.getFromPeer(ctx, peer, key)
+
+		// metrics duration compute
+		duration := int64(time.Since(start)) / int64(time.Millisecond)
+
+		// metrics only store the slowest duration
+		if g.Stats.GetFromPeersLatencyLower.Get() < duration {
+			g.Stats.GetFromPeersLatencyLower.Store(duration)
+		}
+		if err == nil {
+			// populate hot cache with the value retrieved from peer
+			g.populateHotCache(key, value)
+			g.Stats.PeerLoads.Add(1)
+			return nil
+		}
+		return err
+	})
+	return loaded, value, err
+}
+
+func (g *Group) setIfRemoteOwner(ctx context.Context, key string, value []byte, expire time.Time, hotCache bool) (bool, error) {
+	remoteOwner, owner, err := g.callRemoteIfRemoteOwner(ctx, key, func(ctx context.Context, peer ProtoGetter) error {
+		// we do not own the key, so we set the value remotely to the owner peer
+		return g.setFromPeer(ctx, peer, key, value, expire)
+	})
+	if err != nil {
+		return remoteOwner, err
+	}
+	if remoteOwner {
+		// If hotCache is true, we set local hot cache.
+		// TODO(thrawn01): Not sure if this is useful outside of tests...
+		//  maybe we should ALWAYS update the local cache?
+		if hotCache {
+			g.localHotCacheSet(key, value, expire)
+		}
+		// and then we clear the key from all the peers that are not key owner to prevent stale values from being served from those peers.
+		err := g.removeFromPeers(ctx, key, owner)
+		if err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (g *Group) removeFromRemoteOwner(ctx context.Context, key string) (ProtoGetter, error) {
+	remoteOwner, owner, err := g.callRemoteIfRemoteOwner(ctx, key, func(ctx context.Context, peer ProtoGetter) error {
+		// we do not own the key, so we remove the key remotely from the owner peer
+		return g.removeFromPeer(ctx, peer, key)
+	})
+	if err != nil {
+		return owner, err
+	}
+	if remoteOwner {
+		return owner, nil
+	}
+	return nil, nil
+}
+
+// callRemoteIfRemoteOwner calls the given function if the key is owned by a remote peer. It retries the call if there is an remote call error while calling the remote peer
+// until maxRemoteCallErrorRetryTime is reached.
+// It returns a boolean indicating whether the owner is remote, the ProtoGetter of the remote owner if the owner is remote, and an error if any error occurs during the call.
+func (g *Group) callRemoteIfRemoteOwner(ctx context.Context, key string, fn func(ctx context.Context, peer ProtoGetter) error) (bool, ProtoGetter, error) {
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = remoteCallErrorBackoffInitial
+	eb.MaxInterval = remoteCallErrorBackoffMaxInterval
+	eb.MaxElapsedTime = maxRemoteCallErrorRetryTime
+	boCtx := backoff.WithContext(eb, ctx)
+
+	var remoteOwner bool
+	var owner ProtoGetter
+
+	err := backoff.Retry(func() error {
+		var ok bool
+		owner, ok = g.peers.PickPeer(key)
+		if !ok {
+			remoteOwner = false
+			return nil
+		}
+		remoteOwner = true
+
+		err := fn(ctx, owner)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, &ErrNotFound{}) {
+				// we don't want to record or log them, this is not really an error
+				return backoff.Permanent(err)
+			}
+			g.Stats.PeerErrors.Add(1)
+			trace.SpanFromContext(ctx).RecordError(err, trace.WithAttributes(otelAttributePeerURL.String(owner.GetURL())))
+			if errors.Is(err, &ErrRemoteCall{}) {
+				logger.Info().WithFields(map[string]interface{}{
+					"err":      err,
+					"key":      key,
+					"category": "groupcache",
+				}).Printf("error calling peer '%s'", owner.GetURL())
+				return err
+			}
+			logger.Error().WithFields(map[string]interface{}{
+				"err":      err,
+				"key":      key,
+				"category": "groupcache",
+			}).Printf("unexpected error calling peer '%s'", owner.GetURL())
+			return backoff.Permanent(err)
+		}
+
+		return nil
+	}, boCtx)
+	return remoteOwner, owner, err
 }
 
 func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (ByteView, error) {

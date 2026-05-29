@@ -98,10 +98,18 @@ func TestHTTPPool(t *testing.T) {
 	p := NewHTTPPool("should-be-ignored")
 	p.Set(addrToURL(childAddr)...)
 
-	// Dummy getter function. Gets should go to children only.
-	// The only time this process will handle a get is when the
-	// children can't be contacted for some reason.
+	// Dummy getter function. Gets should normally go to children only; the
+	// parent only sees a local get when a remote call falls through (for
+	// example, an ErrRemoteCall from the child after the retry budget is
+	// exhausted). For the special keys below we mirror the child's response
+	// so the assertions remain meaningful after fall-through.
 	getter := GetterFunc(func(ctx context.Context, key string, dest Sink) error {
+		switch key {
+		case "IReturnErrRemoteCall":
+			return &ErrRemoteCall{Msg: "I am a ErrRemoteCall error"}
+		case "IReturnInternalError":
+			return errors.New("I am a errors.New() error")
+		}
 		return errors.New("parent getter called; something's wrong")
 	})
 
@@ -198,7 +206,7 @@ func TestHTTPPool(t *testing.T) {
 	err = g.Get(ctx, "IReturnErrRemoteCall", StringSink(&value))
 	errRemoteCall := &ErrRemoteCall{}
 	if !errors.As(err, &errRemoteCall) {
-		t.Fatal(errors.New("expected error to be 'ErrRemoteCall'"))
+		t.Fatalf("expected error to be 'ErrRemoteCall', got '%v'", err)
 	}
 	assert.Equal(t, "I am a ErrRemoteCall error", errRemoteCall.Error())
 
@@ -285,4 +293,165 @@ func awaitAddrReady(t *testing.T, addr string, wg *sync.WaitGroup) {
 		}
 		time.Sleep(delay)
 	}
+}
+
+func TestHttpGetterClosed(t *testing.T) {
+	// save & restore process-globals so this test composes with others
+	// (TestHTTPPool runs first and registers its own picker; calling
+	// RegisterPeerPicker again would panic).
+	oldPicker := portPicker
+	oldLogger := logger
+	t.Cleanup(func() {
+		portPicker = oldPicker
+		logger = oldLogger
+	})
+	portPicker = nil
+
+	// let's create test peer picker  with two getters
+	getter1Ctx, cancelGetter1 := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancelGetter1()
+	httpGetter1 := &httpGetter{
+		baseURL:            "http://does-not.exist",
+		peerLifetimeCtx:    getter1Ctx,
+		peerLifetimeCancel: cancelGetter1,
+	}
+	getter2Ctx, cancelGetter2 := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancelGetter2()
+	httpGetter2 := &httpGetter{
+		baseURL:            "http://this-too-does-not.exist",
+		peerLifetimeCtx:    getter2Ctx,
+		peerLifetimeCancel: cancelGetter2,
+	}
+	peerPicker := &testPeerPicker{}
+	peerPicker.addPeer(httpGetter1)
+	peerPicker.addPeer(httpGetter2)
+
+	// let's use a test logger to capture logs from the http getters and peer picker
+	logger = testLogger{tb: t}
+	// and register our test peer picker
+	RegisterPeerPicker(func() PeerPicker { return peerPicker })
+
+	// let's create a group with a dummy getter
+	group := NewGroup("httpGetterTest", 1<<20, GetterFunc(func(ctx context.Context, key string, dest Sink) error {
+		return dest.SetString(key, time.Now().Add(time.Second))
+	}))
+
+	// let's attempt to get in a go routine
+	// but first, let's close the getters without removing it from the peer picker
+	httpGetter1.Close()
+	httpGetter2.Close()
+
+	errCh := make(chan error, 1)
+	valCh := make(chan string, 1)
+	go func() {
+		var value string
+		err := group.Get(context.Background(), "testKey", StringSink(&value))
+		if err != nil {
+			errCh <- err
+		}
+		valCh <- value
+	}()
+	// after 5ms let's remove getter 1 from the peer picker so we attempt using getter2
+	<-time.After(5 * time.Millisecond)
+	peerPicker.removePeer(httpGetter1)
+
+	select {
+	case value := <-valCh:
+		t.Logf("Get returned with value: %s", value)
+	case err := <-errCh:
+		// we expect success, it should use the whole retry time and then fetch locally
+		t.Errorf("Get returned with error: %s", err)
+	case <-time.After(2 * time.Second):
+		// this is unexpected
+		t.Fatal("expected Get to return after peerLifetimeCtx was canceled")
+	}
+
+}
+
+type testPeerPicker struct {
+	peers []*httpGetter
+	mu    sync.Mutex
+}
+
+func (p *testPeerPicker) PickPeer(key string) (peer ProtoGetter, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.peers) == 0 {
+		return nil, false
+	}
+	return p.peers[0], true
+}
+func (p *testPeerPicker) GetAll() []ProtoGetter {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	peers := make([]ProtoGetter, len(p.peers))
+	for i, peer := range p.peers {
+		peers[i] = peer
+	}
+
+	return peers
+}
+
+func (p *testPeerPicker) addPeer(peer *httpGetter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.peers = append(p.peers, peer)
+}
+
+func (p *testPeerPicker) removePeer(peer *httpGetter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, pg := range p.peers {
+		if pg.GetURL() == peer.GetURL() {
+			p.peers = append(p.peers[:i], p.peers[i+1:]...)
+			pg.Close()
+			return
+		}
+	}
+}
+
+type testLogger struct {
+	tb     testing.TB
+	logger []string
+}
+
+func (l testLogger) Error() Logger {
+	return l
+}
+
+func (l testLogger) Warn() Logger {
+	return l
+}
+
+func (l testLogger) Info() Logger {
+	return l
+}
+
+func (l testLogger) Debug() Logger {
+	return l
+}
+
+func (l testLogger) ErrorField(label string, err error) Logger {
+	logged := fmt.Sprintf("err(%s)=%s", label, err)
+	l.logger = append(l.logger, logged)
+	return l
+}
+
+func (l testLogger) StringField(label string, val string) Logger {
+	logged := fmt.Sprintf("%s=%s", label, val)
+	l.logger = append(l.logger, logged)
+	return l
+}
+
+func (l testLogger) WithFields(fields map[string]interface{}) Logger {
+	for k, v := range fields {
+		logged := fmt.Sprintf("%s=%v", k, v)
+		l.logger = append(l.logger, logged)
+	}
+	return l
+}
+
+func (l testLogger) Printf(format string, args ...interface{}) {
+	logged := append(l.logger, fmt.Sprintf(format, args...))
+	l.tb.Log(strings.Join(logged, ", "))
 }

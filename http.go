@@ -37,10 +37,6 @@ import (
 const defaultBasePath = "/_groupcache/"
 const defaultReplicas = 50
 
-var (
-	errPeerClosed = errors.New("groupcache: peer is closed")
-)
-
 // HTTPPool implements PeerPicker for a pool of HTTP peers.
 type HTTPPool struct {
 	// this peer's base URL, e.g. "https://example.net:8000"
@@ -137,8 +133,8 @@ func (p *HTTPPool) Set(peers ...string) {
 		if _, ok := peerSet[peer]; !ok {
 			// close the peers being removed to terminate all ongoing requests to them
 			v.Close()
+			delete(p.httpGetters, peer)
 		}
-		delete(p.httpGetters, peer)
 	}
 
 	for _, peer := range peers {
@@ -311,10 +307,19 @@ func (h *httpGetter) makeRequest(ctx context.Context, m string, in request, b io
 		url.PathEscape(in.GetGroup()),
 		url.PathEscape(in.GetKey()),
 	)
+
 	ctx, cancel := context.WithCancelCause(ctx)
-	context.AfterFunc(h.peerLifetimeCtx, func() {
-		cancel(errPeerClosed)
+	defer cancel(nil)
+	stop := context.AfterFunc(h.peerLifetimeCtx, func() {
+		cancel(&ErrRemoteCall{Msg: "peer was closed, likely removed from the peer pool"})
 	})
+	defer stop()
+	select {
+	case <-h.peerLifetimeCtx.Done():
+		return &ErrRemoteCall{Msg: "peer was closed, likely removed from the peer pool"}
+	default:
+	}
+
 	req, err := http.NewRequestWithContext(ctx, m, u, b)
 	if err != nil {
 		return err

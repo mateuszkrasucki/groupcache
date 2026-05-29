@@ -3,6 +3,7 @@ module github.com/ccpgames/groupcache/v2
 go 1.25.0
 
 require (
+	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/golang/protobuf v1.5.4
 	github.com/mailgun/holster/v4 v4.20.3
 	github.com/prometheus/client_golang v1.20.5

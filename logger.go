@@ -94,3 +94,21 @@ func (l LogrusLogger) StringField(label string, val string) Logger {
 func (l LogrusLogger) Printf(format string, args ...interface{}) {
 	l.Entry.Logf(l.level, format, args...)
 }
+
+type NoopLogger struct{}
+
+func (l NoopLogger) Info() Logger { return l }
+
+func (l NoopLogger) Debug() Logger { return l }
+
+func (l NoopLogger) Warn() Logger { return l }
+
+func (l NoopLogger) Error() Logger { return l }
+
+func (l NoopLogger) WithFields(fields map[string]interface{}) Logger { return l }
+
+func (l NoopLogger) ErrorField(label string, err error) Logger { return l }
+
+func (l NoopLogger) StringField(label string, val string) Logger { return l }
+
+func (l NoopLogger) Printf(format string, args ...interface{}) {}
