@@ -307,13 +307,21 @@ func testHTTPPoolSet(t *testing.T, httpPool *HTTPPool, self string) {
 	httpPool.Set(peersIncludingSelf...)
 
 	// check if returned peer list is correct
-	returnedPeers := httpPool.GetPeers()
+	returnedPeers := httpPool.GetPeersList()
 	t.Logf("Returned peers: %v", returnedPeers)
 	if len(returnedPeers) != len(peersIncludingSelf) {
 		t.Fatalf("expected %d peers, got %d", len(peersIncludingSelf), len(returnedPeers))
 	}
 	if !slices.Equal(peersIncludingSelf, returnedPeers) {
 		t.Fatalf("expected peers %v, got %v", peersIncludingSelf, returnedPeers)
+	}
+	returnedRemotePeers := httpPool.GetRemotePeersList()
+	t.Logf("Returned remote peers: %v", returnedRemotePeers)
+	if len(returnedRemotePeers) != len(peers) {
+		t.Fatalf("expected %d remote peers, got %d", len(peers), len(returnedRemotePeers))
+	}
+	if !slices.Equal(peers, returnedRemotePeers) {
+		t.Fatalf("expected remote peers %v, got %v", peers, returnedRemotePeers)
 	}
 
 	// all my getters should be for peers
@@ -336,13 +344,21 @@ func testHTTPPoolSet(t *testing.T, httpPool *HTTPPool, self string) {
 	httpPool.Set(newPeersIncludingSelf...)
 
 	// check if returned peer list is correct
-	returnedPeers = httpPool.GetPeers()
+	returnedPeers = httpPool.GetPeersList()
 	t.Logf("Returned peers after update: %v", returnedPeers)
 	if len(returnedPeers) != len(newPeersIncludingSelf) {
 		t.Fatalf("expected %d peers, got %d", len(newPeersIncludingSelf), len(returnedPeers))
 	}
 	if !slices.Equal(newPeersIncludingSelf, returnedPeers) {
 		t.Fatalf("expected peers %v, got %v", newPeersIncludingSelf, returnedPeers)
+	}
+	returnedRemotePeers = httpPool.GetRemotePeersList()
+	t.Logf("Returned remote peers after update: %v", returnedRemotePeers)
+	if len(returnedRemotePeers) != len(newPeers) {
+		t.Fatalf("expected %d remote peers, got %d", len(newPeers), len(returnedRemotePeers))
+	}
+	if !slices.Equal(newPeers, returnedRemotePeers) {
+		t.Fatalf("expected remote peers %v, got %v", newPeers, returnedRemotePeers)
 	}
 
 	// all  getters should be for peers

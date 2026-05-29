@@ -45,10 +45,11 @@ type HTTPPool struct {
 	// opts specifies the options.
 	opts HTTPPoolOptions
 
-	mu          sync.RWMutex // guards peers and httpGetters
-	peers       *consistenthash.Map
-	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
-	peersList   []string
+	mu              sync.RWMutex // guards peers and peerHttpGetters
+	peersList       []string
+	remotePeersList []string
+	peersHashMap    *consistenthash.Map
+	peerHttpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
 }
 
 // HTTPPoolOptions are the configurations of a HTTPPool.
@@ -98,8 +99,8 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	httpPoolMade = true
 
 	p := &HTTPPool{
-		self:        self,
-		httpGetters: make(map[string]*httpGetter),
+		self:            self,
+		peerHttpGetters: make(map[string]*httpGetter),
 	}
 	if o != nil {
 		p.opts = *o
@@ -110,7 +111,7 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	if p.opts.Replicas == 0 {
 		p.opts.Replicas = defaultReplicas
 	}
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+	p.peersHashMap = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
 
 	RegisterPeerPicker(func() PeerPicker { return p })
 	return p
@@ -123,29 +124,31 @@ func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.peersList = peers
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
-	p.peers.Add(peers...)
+	p.peersHashMap = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+	p.peersHashMap.Add(peers...)
 
 	// build peers set
 	peerSet := make(map[string]struct{}, len(peers))
 	for _, peer := range peers {
 		peerSet[peer] = struct{}{}
 	}
-	for peer, v := range p.httpGetters {
+	for peer, v := range p.peerHttpGetters {
 		if _, ok := peerSet[peer]; !ok {
 			// close the peers being removed to terminate all ongoing requests to them
 			v.Close()
-			delete(p.httpGetters, peer)
+			delete(p.peerHttpGetters, peer)
 		}
 	}
 
+	p.remotePeersList = []string{}
 	for _, peer := range peers {
 		if peer == p.self {
 			continue
 		}
-		if _, ok := p.httpGetters[peer]; !ok {
+		p.remotePeersList = append(p.remotePeersList, peer)
+		if _, ok := p.peerHttpGetters[peer]; !ok {
 			peerLifetimeCtx, peerLifetimeCancel := context.WithCancel(context.Background())
-			p.httpGetters[peer] = &httpGetter{
+			p.peerHttpGetters[peer] = &httpGetter{
 				getTransport:       p.opts.Transport,
 				peer:               peer,
 				baseURL:            peer + p.opts.BasePath,
@@ -156,12 +159,20 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
-// GetPeers returns the list of peers in the pool.
-func (p *HTTPPool) GetPeers() []string {
+// GetPeersList returns the list of peers in the pool.
+func (p *HTTPPool) GetPeersList() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	return p.peersList
+}
+
+// GetRemotePeersList returns the list of remote peers in the pool, excluding self.
+func (p *HTTPPool) GetRemotePeersList() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.remotePeersList
 }
 
 // GetAll returns all the peers in the pool
@@ -170,8 +181,8 @@ func (p *HTTPPool) GetAll() []ProtoGetter {
 	defer p.mu.RUnlock()
 
 	var i int
-	res := make([]ProtoGetter, len(p.httpGetters))
-	for _, v := range p.httpGetters {
+	res := make([]ProtoGetter, len(p.peerHttpGetters))
+	for _, v := range p.peerHttpGetters {
 		res[i] = v
 		i++
 	}
@@ -181,11 +192,11 @@ func (p *HTTPPool) GetAll() []ProtoGetter {
 func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if p.peers.IsEmpty() {
+	if p.peersHashMap.IsEmpty() {
 		return nil, false
 	}
-	if peer := p.peers.Get(key); peer != p.self {
-		return p.httpGetters[peer], true
+	if peer := p.peersHashMap.Get(key); peer != p.self {
+		return p.peerHttpGetters[peer], true
 	}
 	return nil, false
 }
