@@ -38,7 +38,6 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -631,7 +630,6 @@ func (g *Group) callRemoteIfRemoteOwner(ctx context.Context, key string, fn func
 				return backoff.Permanent(err)
 			}
 			g.Stats.PeerErrors.Add(1)
-			trace.SpanFromContext(ctx).RecordError(err, trace.WithAttributes(otelAttributePeerURL.String(owner.GetURL())))
 			if errors.Is(err, &ErrRemoteCall{}) {
 				logger.Info().WithFields(map[string]interface{}{
 					"err":      err,
